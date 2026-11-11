@@ -1,111 +1,101 @@
-name: farm-cloud-tokens
+name: farm
 
-# Manual trigger only: farms switched.cloud Cloud Tokens through the Cuty route and
-# optionally spends the whole balance as VPS runtime.
-#
-# Panel v2.0 removed the old "Earn with Vylo" button. New automatable route is Cuty
-# (1 token/link, 2 links/day) + a daily streak that credits just for opening /tokens.
-# Linkvertise (1.5/link, 10/day) is intentionally NOT farmed: its free path needs
-# hcaptcha + a subscription wall, which a CI runner cannot pass safely.
-#
-# cuttty.com's Turnstile rejects datacenter IPs, so a residential exit is required:
-#   * secret HOME_VLESS_URL (preferred) or JP_SOCKS_URL -> local sing-box relay on 10900
-#   * secret PROXY          -> ready-made socks5:// or http:// proxy URL
-on:
+"on":
   workflow_dispatch:
     inputs:
       count:
-        description: "max Cuty links to attempt (panel hard cap is 2/day; extra is ignored)"
-        default: "25"
-        required: true
-      spend:
-        description: "spend all tokens as runtime afterwards (默认不换，token 留在余额里)"
-        type: boolean
-        default: false
-      proxy:
-        description: "override proxy URL (empty = use PROXY secret or local sing-box)"
-        default: ""
+        description: "运行轮数 / 任务计数"
         required: false
-
-permissions:
-  contents: read
-
-concurrency:
-  group: farm-cloud-tokens
-  cancel-in-progress: false
+        default: "25"
+      proxy:
+        description: "可选: 单次指定的代理节点链接 (支持 hysteria2 / socks5 / vless)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 4,16 * * *"
 
 jobs:
   farm:
-    timeout-minutes: 90
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run actions/setup-python@v5
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Start upstream relay (HOME_VLESS_URL or JP_SOCKS_URL -> local 10900)
-        env:
-          HOME_VLESS_URL: ${{ secrets.HOME_VLESS_URL }}
-          JP_SOCKS_URL: ${{ secrets.JP_SOCKS_URL }}
+      - name: Install dependencies
         run: |
-          RELAY_URL="${HOME_VLESS_URL:-$JP_SOCKS_URL}"
-          if [ -z "$RELAY_URL" ]; then
-            echo "no relay secret - skipping relay"
-            exit 0
-          fi
-          VER=1.14.1
-          curl -sSLo sb.tgz "https://github.com/SagerNet/sing-box/releases/download/v${VER}/sing-box-${VER}-linux-amd64.tar.gz"
-          tar xzf sb.tgz
-          cp "sing-box-${VER}-linux-amd64/sing-box" ./sing-box
-          python scripts/make_relay.py "$RELAY_URL" relay.json
-          nohup ./sing-box run -c relay.json > sb.log 2>&1 &
-          for i in $(seq 25); do
-            ip=$(curl -s -m 6 --socks5-hostname 127.0.0.1:10900 https://api.ipify.org || true)
-            if [ -n "$ip" ]; then echo "relay exit ip: $ip"; break; fi
-            sleep 3
-          done
-          tail -3 sb.log || true
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Install playwright
         run: |
-          python -m pip install -q --upgrade pip
-          pip install -q -r requirements.txt
           python -m playwright install --with-deps chromium
+
+      # 启动 sing-box 本地流量转发核心
+      - name: Setup & Start sing-box relay
+        env:
+          PROXY_URL: ${{ inputs.proxy || secrets.PROXY_URL || secrets.SECRET_PROXY || secrets.JP_SOCKS_URL || secrets.HOME_VLESS_URL }}
+        run: |
+          if [ -z "$PROXY_URL" ]; then
+            echo "未检测到代理 Secret，跳过 sing-box 启动。"
+            exit 0
+          fi
+
+          echo "正在下载 sing-box 官方二进制文件..."
+          TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          VERSION=${TAG#v}
+          curl -fsSL -o sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf sing-box.tar.gz --strip-components=1
+          sudo mv sing-box /usr/local/bin/
+          sing-box version
+
+          echo "生成 sing-box 本地转发布局..."
+          python3 scripts/make_relay.py "$PROXY_URL"
+
+          if [ -f "sing-box-config.json" ]; then
+            echo "启动 sing-box 守护进程..."
+            nohup sing-box run -c sing-box-config.json > sing-box.log 2>&1 &
+            sleep 2
+
+            # 校验本地 10900 端口存活
+            if nc -z 127.0.0.1 10900; then
+              echo "sing-box 启动成功，本地转发端口 127.0.0.1:10900 已就绪。"
+            else
+              echo "sing-box 启动失败，日志输出如下:"
+              cat sing-box.log
+              exit 1
+            fi
+          fi
 
       - name: Farm
         env:
-          NOPROFIT_COOKIES: ${{ secrets.NOPROFIT_COOKIES }}
-          INPUT_PROXY: ${{ github.event.inputs.proxy }}
-          SECRET_PROXY: ${{ secrets.PROXY }}
-          COUNT: ${{ github.event.inputs.count }}
+          NOPROFIT_COOKIES: ${{ secrets.NOPROFIT_COOKIES || secrets.SWITCHED_COOKIES }}
+          SWITCHED_COOKIES: ${{ secrets.SWITCHED_COOKIES || secrets.NOPROFIT_COOKIES }}
+          COUNT: ${{ inputs.count || '25' }}
         run: |
           set -o pipefail
-          export SW_PROXY="${INPUT_PROXY:-${SECRET_PROXY:-socks5://127.0.0.1:10900}}"
-          echo "proxy: ${SW_PROXY%%@*}"
+          # 检查本地是否有 sing-box 转发监听
+          if nc -z 127.0.0.1 10900 2>/dev/null; then
+            export SW_PROXY="socks5://127.0.0.1:10900"
+            echo "已接入本地 sing-box 转发通道: $SW_PROXY"
+          else
+            echo "未启动代理中继，使用直连模式。"
+          fi
+
           xvfb-run -a -s "-screen 0 1400x1000x24" python3 -u vylo_farm.py --count "$COUNT" 2>&1 | tee farm.log
           grep SUMMARY farm.log || true
 
       - name: Upload logs on failure
-        if: ${{ failure() || cancelled() }}
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: farm-debug
+          name: failure-logs
           path: |
-            farm.log
-            sb.log
-            /tmp/cuty_fail_*.png
-          if-no-files-found: ignore
-
-      - name: Spend tokens as runtime
-        # always(): 即使 Farm 失败(面板抽风/连续失败)，也把已有余额换成时长，别让保活断在这。
-        # 余额为 0 时 add_runtime.py 自己会安全跳过。
-        if: ${{ always() && github.event.inputs.spend == 'true' }}
-        env:
-          NOPROFIT_COOKIES: ${{ secrets.NOPROFIT_COOKIES }}
-          INPUT_PROXY: ${{ github.event.inputs.proxy }}
-          SECRET_PROXY: ${{ secrets.PROXY }}
-        run: |
-          export SW_PROXY="${INPUT_PROXY:-${SECRET_PROXY:-socks5://127.0.0.1:10900}}"
-          xvfb-run -a python3 -u add_runtime.py --tokens 0
+            *.log
+            *.png
+          retention-days: 2
